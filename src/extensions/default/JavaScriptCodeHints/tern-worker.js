@@ -102,6 +102,33 @@ importScripts("thirdparty/requirejs/require.js");
         return request;
     }
     
+    /**
+     * Get definition location
+     * @param {string} dir      - the directory
+     * @param {string} file     - the file name
+     * @param {number} offset   - the offset into the file for cursor
+     * @param {string} text     - the text of the file
+     */
+    function getJumptoDef(dir, file, offset, text) {
+        
+        var request = buildRequest(dir, file, "definition", offset, text);
+        request.query.lineCharPositions = true;
+        ternServer.request(request, function(error, data) {
+            if (error) {
+                _log("definition error: " + JSON.stringify(data));
+                self.postMessage({type: HintUtils.TERN_JUMPTODEF_MSG,});
+                return;
+            }
+            
+            // Post a message back to the main thread with the definition
+            self.postMessage({type: HintUtils.TERN_JUMPTODEF_MSG,
+                              file: data.file,
+                              start: data.start,
+                              end: data.end
+                             });
+        });
+    }
+    
     
     /**
      * Get the completions for the given offset
@@ -232,6 +259,12 @@ importScripts("thirdparty/requirejs/require.js");
             text    = request.text;
             var pos = request.pos;
             handleFunctionType(dir, file, pos, text);            
+        } else if ( type === HintUtils.TERN_JUMPTODEF_MSG ) {
+            var file    = request.file,
+                dir     = request.dir,
+                offset  = request.offset,
+                text    = request.text;
+            getJumptoDef(dir, file, offset, text);
         } else {
             _log("Unknown message: " + JSON.stringify(request));
         }
