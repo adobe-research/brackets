@@ -27,7 +27,9 @@
 define(function (require, exports, module) {
     "use strict";
 
-    var HintUtils       = require("HintUtils");
+    var StringMatch     = brackets.getModule("utils/StringMatch"),
+        HintUtils       = require("HintUtils"),
+        ScopeManager    = require("ScopeManager");
 
     /**
      * Session objects encapsulate state associated with a hinting session
@@ -42,6 +44,17 @@ define(function (require, exports, module) {
         this.ternHints = [];
         this.ternProperties = [];
         this.fnType = null;
+        this.builtins = ScopeManager.getBuiltins().map(function (builtin) {
+            // remove extension from name, if any.
+            var index = builtin.lastIndexOf(".");
+            if (index !== -1) {
+                builtin = builtin.substring(0, index);
+            }
+
+            return builtin;
+        });
+
+        this.builtins.push("requirejs.js");     // consider these globals as well.
     }
 
     /**
@@ -290,240 +303,89 @@ define(function (require, exports, module) {
      * Get a list of hints for the current session using the current scope
      * information. 
      *
-     * @param {string} query - the query prefix (optional)
+     * @param {string} query - the query prefix
+     * @param {StringMatcher} matcher - the class to find query matches and sort the results
      * @return {Array.<Object>} - the sorted list of hints for the current 
      *      session.
      */
-    Session.prototype.getHints = function (query) {
+    Session.prototype.getHints = function (query, matcher) {
 
         if (query === undefined) {
             query = "";
         }
 
-        var MAX_DISPLAYED_HINTS = 500,
-            QUERY_PREFIX_LENGTH = 1;    // Any query of this size or less is matched as a prefix of a hint.
+        var MAX_DISPLAYED_HINTS = 500;
 
-        /*
-         * Filter a list of tokens using the query string in the closure.
+        /**
+         *  Is the origin one of the builtin files.
          *
-         * @param {Array.<Object>} tokens - list of hints to filter
-         * @param {number} limit - maximum numberof tokens to return
-         * @return {Array.<Object>} - filtered list of hints
+         * @param {string} origin
          */
-        function filterWithQuery(tokens, limit) {
+        function isBuiltin(origin) {
+            return builtins.indexOf(origin) !== -1;
+        }
 
-            /*
-             * Filter arr using test, returning at most limit results from the
-             * front of the array.
-             *
-             * @param {Array} arr - array to filter
-             * @param {Function} test - test to determine if an element should
-             *      be included in the results
-             * @param {number} limit - the maximum number of elements to return
-             * @return {Array.<Object>} - new array of filtered elements
-             */
-            function filterArrayPrefix(arr, test, limit) {
-                var i = 0,
-                    results = [],
-                    elem;
-
-                for (i; i < arr.length && results.length <= limit; i++) {
-                    elem = arr[i];
-                    if (test(elem)) {
-                        results.push(elem);
+        /**
+         *  Filter an array hints using a given query and matcher.
+         *  The hints are returned in the format of the matcher.
+         *  The matcher returns the value in the "label" property,
+         *  the match score in "matchGoodness" property.
+         *
+         * @param {Array} hints - array of hints
+         * @param {StringMatcher} matcher
+         * @returns {Array} - array of matching hints.
+         */
+        function filterWithQueryAndMatcher(hints, matcher) {
+            var matchResults = $.map(hints, function (hint) {
+                var searchResult = matcher.match(hint.value, query);
+                if (searchResult) {
+                    searchResult.value = hint.value;
+                    searchResult.guess = hint.guess;
+                    if (hint.depth !== undefined) {
+                        searchResult.depth = hint.depth;
                     }
-                }
 
-                return results;
-            }
-
-            if (query.length > 0) {
-                return filterArrayPrefix(tokens, function (token) {
-                    if (token.literal && token.kind === "string") {
-                        return false;
+                    if (!type.property && !type.showFunctionType && hint.origin &&
+                        isBuiltin(hint.origin)) {
+                        searchResult.builtin = 1;
                     } else {
-                        if (query.length > QUERY_PREFIX_LENGTH) {
-                            return (token.value.toLowerCase().indexOf(query.toLowerCase()) !== -1);
-                        } else {
-                            return (token.value.toLowerCase().indexOf(query.toLowerCase()) === 0);
-                        }
+                        searchResult.builtin = 0;
                     }
-                }, limit);
-            } else {
-                return tokens.slice(0, limit);
-            }
-        }
-
-        /**
-         * Sort the better matching items to the top.
-         * Prefix matches are considered the best and all others are equal.
-         * @param a
-         * @param b
-         */
-        function compareByBestMatch(a, b) {
-            var index1 = a.value.toLowerCase().indexOf(query.toLowerCase()),
-                index2 = b.value.toLowerCase().indexOf(query.toLowerCase());
-
-            if (index1 === 0 && index2 !== 0) {
-                return -1;
-            } else if (index1 !== 0 && index2 === 0) {
-                return 1;
-            }
-
-            return 0;
-        }
-
-        /*
-         * Comparator for sorting tokens by name
-         *
-         * @param {Object} a - a token
-         * @param {Object} b - another token
-         * @return {number} - comparator value that indicates whether the name
-         *      of token a is lexicographically lower than the name of token b
-         */
-        function compareByName(a, b) {
-            var aLowerCase = a.value.toLowerCase();
-            var bLowerCase = b.value.toLowerCase();
-
-            if (aLowerCase === bLowerCase) {
-                return 0;
-            } else if (aLowerCase < bLowerCase) {
-                return -1;
-            } else {
-                return 1;
-            }
-        }
-        /**
-         * sort by scope depth.
-         *
-         * @param a
-         * @param b
-         * @return {*}
-         */
-        function compareByScopeDepth(a, b) {
-            var adepth = a.depth;
-            var bdepth = b.depth;
-
-            if (adepth >= 0) {
-                if (bdepth >= 0) {
-                    return adepth - bdepth;
-                } else {
-                    return -1;
                 }
-            } else if (bdepth >= 0) {
-                return 1;
-            } else {
-                return 0;
-            }
-        }
 
-        /*
-         * Forms the lexicographical composition of comparators, i.e., 
-         * "a lex(c1,c2) b" iff "a c1 b or (a = b and a c2 b)"
-         * 
-         * @param {Function} compare1 - a comparator
-         * @param {Function} compare2 - another comparator
-         * @return {Function} - the lexicographic composition of comparator1
-         *      and comparator2
-         */
-        function lexicographic(compare1, compare2) {
-            return function (a, b) {
-                var result = compare1(a, b);
-                if (result === 0) {
-                    return compare2(a, b);
-                } else {
-                    return result;
-                }
-            };
-        }
+                return searchResult;
+            });
 
-        /*
-         * A comparator for identifiers: the lexicographic combination of
-         * scope and name.
-         *
-         * @return {Function} - the comparator function
-         */
-        function compareProperties() {
-            return (query.length > QUERY_PREFIX_LENGTH) ?
-                       lexicographic(compareByBestMatch, compareByName) :
-                       compareByName;
-        }
-
-        /*
-         * A comparator for identifiers: the lexicographic combination of
-         * scope and name.
-         *
-         * @return {Function} - the comparator function
-         */
-        function compareIdentifiers() {
-            return (query.length > QUERY_PREFIX_LENGTH) ?
-                       lexicographic(compareByBestMatch,
-                           lexicographic(compareByScopeDepth, compareByName)) :
-                       lexicographic(compareByScopeDepth, compareByName);
-        }
-
-        /*
-         *  Determine if guesses should be added to the hints.
-         *
-         *  @param {Array} hints - current filtered hints
-         *  @return true if guesses should be added, false otherwise.
-         */
-        function shouldAddGuesses(hints) {
-            return (hints.length === 0);
-        }
-
-        /*
-         *  Remove the special "<i>" property from the hints.
-         *
-         *  @param {Array} hints - sorted hints
-         */
-        function removeArrayIndexProperty(hints) {
-            var n = hints.length,
-                i;
-            for (i = 0; i < n; i++) {
-                var value = hints[i].value;
-                if (value === "<i>") {
-                    hints.splice(i, 1);
-                    return;
-                } else if (value > "<i>") {
-                    return;
-                }
-            }
+            return matchResults;
         }
 
         var type = this.getType(),
+            builtins = this.builtins,
             hints;
 
-        var ternHints = this.ternHints;
         if (type.property) {
-            if (ternHints && ternHints.length > 0) {
-                hints = ternHints;
-                hints = filterWithQuery(hints, MAX_DISPLAYED_HINTS);
-            } else {
-                hints = [];
+            hints = this.ternHints || [];
+            hints = filterWithQueryAndMatcher(hints, matcher);
+
+            // If there are no hints then switch over to guesses.
+            if (hints.length === 0) {
+                hints = filterWithQueryAndMatcher(this.ternProperties, matcher);
             }
 
-            hints.sort(compareProperties());
-
-            // Add guesses if appropriate. If guesses and hints are
-            // mixed guesses are kept below the hints.
-            if (shouldAddGuesses(hints)) {
-                var guesses = filterWithQuery(this.ternProperties, MAX_DISPLAYED_HINTS - hints.length);
-                guesses.sort(compareProperties());
-                removeArrayIndexProperty(guesses);
-                hints = hints.concat(guesses);
-            }
-
+            StringMatch.multiFieldSort(hints, { matchGoodness: 0, value: 1 });
         } else if ( type.showFunctionType ) {
             hints = this.getFunctionTypeHint();            
-        } else {
-            hints = ternHints || [];
-            hints.sort(compareIdentifiers());
+        } else {     // identifiers, literals, and keywords
+            hints = this.ternHints || [];
             hints = hints.concat(HintUtils.LITERALS);
             hints = hints.concat(HintUtils.KEYWORDS);
-            hints = filterWithQuery(hints, MAX_DISPLAYED_HINTS);
+            hints = filterWithQueryAndMatcher(hints, matcher);
+            StringMatch.multiFieldSort(hints, { matchGoodness: 0, depth: 1, builtin: 2, value: 3 });
         }
 
+        if (hints.length > MAX_DISPLAYED_HINTS) {
+            hints = hints.slice(0, MAX_DISPLAYED_HINTS);
+        }
         return hints;
     };
     
